@@ -1,0 +1,440 @@
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(typeof globalThis !== 'undefined' ? globalThis : root);
+    return;
+  }
+
+  root.markSnipNotifications = factory(root);
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (root) {
+  const SUPPORT_NOTIFICATION_THRESHOLDS = Object.freeze([25, 100, 500, 1000, 2500, 5000, 10000]);
+  const REVIEW_REQUEST_THRESHOLD = 10;
+  const RELEASES_URL = 'https://github.com/DhruvParikh1/markdownload-extension-updated/releases';
+  const BUY_ME_A_COFFEE_URL = 'https://buymeacoffee.com/dhruvparikh';
+  const CHROME_REVIEW_URL = 'https://chromewebstore.google.com/detail/marksnip-markdown-web-cli/kcbaglhfgbkjdnpeokaamjjkddempipm/reviews';
+  const FIREFOX_REVIEW_URL = 'https://addons.mozilla.org/en-US/firefox/addon/marksnip-markdown-web-clipper/reviews/';
+  const STORAGE_DEFAULTS = Object.freeze({
+    lastInstalledVersion: null,
+    successfulExportsCount: 0,
+    successfulDownloadsCount: 0,
+    successfulCopiesCount: 0,
+    successfulObsidianSendsCount: 0,
+    successfulBatchUrlsCount: 0,
+    shownSupportThresholds: [],
+    shownUpdateVersions: [],
+    shownReviewRequest: false,
+    pendingNotifications: []
+  });
+  const STORAGE_KEYS = Object.freeze(Object.keys(STORAGE_DEFAULTS));
+  const NOTIFICATION_TYPE_PRIORITY = Object.freeze({
+    'version-update': 0,
+    'support-milestone': 1,
+    'review-request': 2
+  });
+
+  function getI18n() {
+    return root?.markSnipI18n || null;
+  }
+
+  function i18nMessage(key, substitutions, fallback) {
+    return getI18n()?.t(key, substitutions, fallback) || fallback || key;
+  }
+
+  function toNonNegativeInteger(value) {
+    const normalized = Number(value);
+    if (!Number.isFinite(normalized) || normalized <= 0) {
+      return 0;
+    }
+    return Math.floor(normalized);
+  }
+
+  function normalizeTimestamp(value) {
+    const normalized = Number(value);
+    if (!Number.isFinite(normalized) || normalized <= 0) {
+      return null;
+    }
+    return Math.floor(normalized);
+  }
+
+  function normalizeStringArray(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    return value
+      .filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
+      .map((entry) => entry.trim());
+  }
+
+  function normalizeNumericArray(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    return value
+      .map(toNonNegativeInteger)
+      .filter((entry) => entry > 0);
+  }
+
+  function sanitizeAction(action) {
+    if (!action || typeof action !== 'object' || typeof action.url !== 'string' || !action.url.trim()) {
+      return null;
+    }
+
+    return {
+      label: typeof action.label === 'string' && action.label.trim()
+        ? action.label.trim()
+        : 'Open link',
+      url: action.url.trim()
+    };
+  }
+
+  function sanitizeHighlights(highlights) {
+    if (!Array.isArray(highlights)) {
+      return [];
+    }
+
+    return highlights
+      .filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
+      .map((entry) => entry.trim())
+      .slice(0, 5);
+  }
+
+  function sanitizeNotification(notification) {
+    const createdAt = normalizeTimestamp(notification?.createdAt) || Date.now();
+
+    return {
+      id: typeof notification?.id === 'string' && notification.id.trim()
+        ? notification.id.trim()
+        : `notification:${createdAt}`,
+      type: typeof notification?.type === 'string' ? notification.type : 'support-milestone',
+      createdAt,
+      title: typeof notification?.title === 'string' ? notification.title : '',
+      message: typeof notification?.message === 'string' ? notification.message : '',
+      previousVersion: typeof notification?.previousVersion === 'string' ? notification.previousVersion : null,
+      currentVersion: typeof notification?.currentVersion === 'string' ? notification.currentVersion : null,
+      milestone: toNonNegativeInteger(notification?.milestone) || null,
+      highlights: sanitizeHighlights(notification?.highlights),
+      primaryAction: sanitizeAction(notification?.primaryAction),
+      secondaryAction: sanitizeAction(notification?.secondaryAction),
+      showCount: toNonNegativeInteger(notification?.showCount),
+      lastShownAt: normalizeTimestamp(notification?.lastShownAt)
+    };
+  }
+
+  function ensureNotificationState(rawState) {
+    const raw = rawState && typeof rawState === 'object' ? rawState : {};
+
+    return {
+      lastInstalledVersion: typeof raw.lastInstalledVersion === 'string' && raw.lastInstalledVersion.trim()
+        ? raw.lastInstalledVersion.trim()
+        : null,
+      successfulExportsCount: toNonNegativeInteger(raw.successfulExportsCount),
+      successfulDownloadsCount: toNonNegativeInteger(raw.successfulDownloadsCount),
+      successfulCopiesCount: toNonNegativeInteger(raw.successfulCopiesCount),
+      successfulObsidianSendsCount: toNonNegativeInteger(raw.successfulObsidianSendsCount),
+      successfulBatchUrlsCount: toNonNegativeInteger(raw.successfulBatchUrlsCount),
+      shownSupportThresholds: normalizeNumericArray(raw.shownSupportThresholds),
+      shownUpdateVersions: normalizeStringArray(raw.shownUpdateVersions),
+      shownReviewRequest: raw.shownReviewRequest === true,
+      pendingNotifications: Array.isArray(raw.pendingNotifications)
+        ? raw.pendingNotifications.map(sanitizeNotification)
+        : []
+    };
+  }
+
+  function formatCount(value) {
+    const normalizedValue = toNonNegativeInteger(value);
+    if (getI18n()?.number) {
+      return getI18n().number(normalizedValue);
+    }
+    return new Intl.NumberFormat('en-US').format(normalizedValue);
+  }
+
+  function hasPendingNotificationType(state, type) {
+    return ensureNotificationState(state).pendingNotifications.some((notification) => notification.type === type);
+  }
+
+  function sortPendingNotifications(notifications) {
+    return [...notifications].sort((left, right) => {
+      const leftPriority = NOTIFICATION_TYPE_PRIORITY[left.type] ?? 99;
+      const rightPriority = NOTIFICATION_TYPE_PRIORITY[right.type] ?? 99;
+      if (leftPriority !== rightPriority) {
+        return leftPriority - rightPriority;
+      }
+      return left.createdAt - right.createdAt;
+    });
+  }
+
+  // Cards not yet shown come first, so one card the user ignored cannot block
+  // every later card from appearing.
+  function getNextPendingNotification(state) {
+    const nextState = ensureNotificationState(state);
+    const sorted = sortPendingNotifications(nextState.pendingNotifications);
+    return sorted.find((notification) => notification.showCount === 0) || sorted[0] || null;
+  }
+
+  function upsertNotification(state, notification) {
+    const nextState = ensureNotificationState(state);
+    const sanitizedNotification = sanitizeNotification(notification);
+    const withoutExisting = nextState.pendingNotifications.filter(
+      (entry) => entry.id !== sanitizedNotification.id
+    );
+
+    withoutExisting.push(sanitizedNotification);
+
+    return {
+      ...nextState,
+      pendingNotifications: withoutExisting
+    };
+  }
+
+  function dismissNotification(state, notificationId) {
+    const nextState = ensureNotificationState(state);
+
+    return {
+      ...nextState,
+      pendingNotifications: nextState.pendingNotifications.filter((entry) => entry.id !== notificationId)
+    };
+  }
+
+  function markNotificationShown(state, notificationId, shownAt) {
+    const nextState = ensureNotificationState(state);
+    const normalizedShownAt = normalizeTimestamp(shownAt) || Date.now();
+
+    return {
+      ...nextState,
+      pendingNotifications: nextState.pendingNotifications.map((entry) => {
+        if (entry.id !== notificationId) {
+          return entry;
+        }
+
+        return {
+          ...entry,
+          showCount: entry.showCount + 1,
+          lastShownAt: normalizedShownAt
+        };
+      })
+    };
+  }
+
+  function createVersionUpdateNotification(config) {
+    const previousVersion = typeof config?.previousVersion === 'string' ? config.previousVersion : null;
+    const currentVersion = typeof config?.currentVersion === 'string' ? config.currentVersion : null;
+
+    return sanitizeNotification({
+      id: `version-update:${currentVersion}`,
+      type: 'version-update',
+      createdAt: Date.now(),
+      title: i18nMessage(
+        'notifVersionUpdateTitle',
+        [currentVersion || ''],
+        `MarkSnip updated to v${currentVersion}`
+      ),
+      message: previousVersion
+        ? i18nMessage(
+            'notifVersionUpdateMessage',
+            [previousVersion, currentVersion || ''],
+            `Updated from v${previousVersion} to v${currentVersion}.`
+          )
+        : i18nMessage(
+            'notifVersionUpdateMessageNew',
+            [currentVersion || ''],
+            `MarkSnip updated to v${currentVersion}.`
+          ),
+      previousVersion,
+      currentVersion,
+      highlights: sanitizeHighlights(config?.highlights),
+      primaryAction: {
+        label: i18nMessage('notifActionBuyCoffee', null, 'Buy Me a Coffee'),
+        url: config?.buyMeACoffeeUrl || BUY_ME_A_COFFEE_URL
+      },
+      secondaryAction: {
+        label: i18nMessage('notifActionReleaseNotes', null, 'View release notes'),
+        url: config?.releaseNotesUrl || RELEASES_URL
+      }
+    });
+  }
+
+  function createSupportNotification(config) {
+    const milestone = toNonNegativeInteger(config?.milestone);
+    const formattedMilestone = formatCount(milestone);
+
+    return sanitizeNotification({
+      id: `support-milestone:${milestone}`,
+      type: 'support-milestone',
+      createdAt: Date.now(),
+      title: i18nMessage(
+        'notifSupportTitle',
+        [formattedMilestone],
+        `${formattedMilestone} pages exported`
+      ),
+      message: i18nMessage(
+        'notifSupportMessage',
+        [formattedMilestone],
+        `MarkSnip has helped export over ${formattedMilestone} pages. If it has been useful, support ongoing development.`
+      ),
+      milestone,
+      primaryAction: {
+        label: i18nMessage('notifActionBuyCoffee', null, 'Buy Me a Coffee'),
+        url: config?.buyMeACoffeeUrl || BUY_ME_A_COFFEE_URL
+      },
+      secondaryAction: {
+        label: i18nMessage('notifActionReleaseNotes', null, 'View release notes'),
+        url: config?.releaseNotesUrl || RELEASES_URL
+      }
+    });
+  }
+
+  function createReviewNotification(config) {
+    const reviewUrl = config?.browser === 'firefox' ? FIREFOX_REVIEW_URL : CHROME_REVIEW_URL;
+
+    return sanitizeNotification({
+      id: 'review-request',
+      type: 'review-request',
+      createdAt: Date.now(),
+      title: i18nMessage('notifReviewTitle', null, 'Enjoying MarkSnip?'),
+      message: i18nMessage(
+        'notifReviewMessage',
+        null,
+        'A quick review helps others discover MarkSnip and takes less than a minute.'
+      ),
+      primaryAction: {
+        label: i18nMessage('notifActionLeaveReview', null, 'Leave a Review'),
+        url: reviewUrl
+      },
+      secondaryAction: null
+    });
+  }
+
+  function queueReviewRequest(state, config) {
+    const nextState = ensureNotificationState(state);
+
+    if (nextState.shownReviewRequest) {
+      return nextState;
+    }
+
+    if (nextState.successfulExportsCount < REVIEW_REQUEST_THRESHOLD) {
+      return nextState;
+    }
+
+    const withReviewTracked = {
+      ...nextState,
+      shownReviewRequest: true
+    };
+
+    return upsertNotification(withReviewTracked, createReviewNotification(config));
+  }
+
+  function queueVersionUpdate(state, config) {
+    const nextState = ensureNotificationState(state);
+    const currentVersion = typeof config?.currentVersion === 'string' ? config.currentVersion : null;
+
+    if (!currentVersion || nextState.shownUpdateVersions.includes(currentVersion)) {
+      return nextState;
+    }
+
+    const withTrackedVersion = {
+      ...nextState,
+      shownUpdateVersions: [...nextState.shownUpdateVersions, currentVersion]
+    };
+
+    return upsertNotification(withTrackedVersion, createVersionUpdateNotification(config));
+  }
+
+  function applyMetricDelta(state, delta) {
+    const nextState = ensureNotificationState(state);
+    const changes = delta && typeof delta === 'object' ? delta : {};
+
+    return {
+      ...nextState,
+      successfulExportsCount: nextState.successfulExportsCount + toNonNegativeInteger(changes.exports),
+      successfulDownloadsCount: nextState.successfulDownloadsCount + toNonNegativeInteger(changes.downloads),
+      successfulCopiesCount: nextState.successfulCopiesCount + toNonNegativeInteger(changes.copies),
+      successfulObsidianSendsCount: nextState.successfulObsidianSendsCount + toNonNegativeInteger(changes.obsidianSends),
+      successfulBatchUrlsCount: nextState.successfulBatchUrlsCount + toNonNegativeInteger(changes.batchUrls)
+    };
+  }
+
+  function getNextSupportThreshold(state) {
+    const nextState = ensureNotificationState(state);
+
+    for (const threshold of SUPPORT_NOTIFICATION_THRESHOLDS) {
+      if (
+        nextState.successfulExportsCount >= threshold &&
+        !nextState.shownSupportThresholds.includes(threshold)
+      ) {
+        return threshold;
+      }
+    }
+
+    return null;
+  }
+
+  function queueNextSupportNotification(state, config) {
+    const nextState = ensureNotificationState(state);
+
+    if (hasPendingNotificationType(nextState, 'support-milestone')) {
+      return nextState;
+    }
+
+    const nextThreshold = getNextSupportThreshold(nextState);
+    if (!nextThreshold) {
+      return nextState;
+    }
+
+    const withTrackedThreshold = {
+      ...nextState,
+      shownSupportThresholds: [...nextState.shownSupportThresholds, nextThreshold]
+    };
+
+    return upsertNotification(
+      withTrackedThreshold,
+      createSupportNotification({
+        ...config,
+        milestone: nextThreshold
+      })
+    );
+  }
+
+  function queueUsageNotifications(state, config) {
+    let nextState = queueNextSupportNotification(state, {
+      buyMeACoffeeUrl: config?.buyMeACoffeeUrl,
+      releaseNotesUrl: config?.releaseNotesUrl
+    });
+
+    if (hasPendingNotificationType(nextState, 'support-milestone')) {
+      return nextState;
+    }
+
+    return queueReviewRequest(nextState, {
+      browser: config?.browser
+    });
+  }
+
+  return {
+    BUY_ME_A_COFFEE_URL,
+    CHROME_REVIEW_URL,
+    FIREFOX_REVIEW_URL,
+    RELEASES_URL,
+    REVIEW_REQUEST_THRESHOLD,
+    STORAGE_DEFAULTS,
+    STORAGE_KEYS,
+    SUPPORT_NOTIFICATION_THRESHOLDS,
+    applyMetricDelta,
+    createReviewNotification,
+    createSupportNotification,
+    createVersionUpdateNotification,
+    dismissNotification,
+    ensureNotificationState,
+    getNextPendingNotification,
+    getNextSupportThreshold,
+    hasPendingNotificationType,
+    markNotificationShown,
+    queueNextSupportNotification,
+    queueReviewRequest,
+    queueUsageNotifications,
+    queueVersionUpdate,
+    sortPendingNotifications,
+    upsertNotification
+  };
+});
